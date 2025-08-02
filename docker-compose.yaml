@@ -1,0 +1,23 @@
+services:
+  confluence_server:
+    build:
+      context: ./
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2g
+        reservations:
+          cpus: "0.5"
+          memory: 1g
+    container_name: confluence
+    volumes:
+      - ./src/:/app
+    env_file:
+      - .env
+    ports:
+      - 8050
+
+networks:
+  bing_adds:
+    driver: bridge
