@@ -48,3 +48,18 @@ Grant the following permissions to your Service Account
     - Logs Writer
 
 ```
+
+## Running The Automation
+Execute the following command in your project folder terminal to run the application:
+```bash
+
+docker compose up
+
+```
+
+## License
+Refer tp the [LICENSE](LICENSE) for terms of use.
+
+## Contributions
+Contributions are very much welcome.<br>
+If you encounter problems feel free to open an issue.
