@@ -384,7 +384,7 @@ def write_table_to_bq(table_id: str, schema: list[bigquery.SchemaField], file: s
     return True
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-def make_api_request(resource_type: str, /, **kwargs: Any) -> list[dict[str, Any]] | None:
+def make_api_request(resource_type: str) -> list[dict[str, Any]] | None:
     """
     Make an API request to Confluence API
     Args:
