@@ -15,7 +15,7 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 jira_api_url          = os.getenv("BASE_URL")
 project_name          = os.getenv("PROJECT_NAME")
-jira_auth_token       = HTTPBasicAuth(os.getenv("EMAIL"), os.getenv("API_TOKEN"))
+auth_token       = HTTPBasicAuth(os.getenv("EMAIL"), os.getenv("API_TOKEN"))
 dataset_name          = os.getenv("DATASET")
 gcs_bucket_name       = os.getenv("GCP_STORAGE_BUCKET")
 bq_client             = bigquery.Client(project=project_name)
@@ -82,6 +82,7 @@ attachments_table_schema = [
     bigquery.SchemaField("fileId", "STRING", mode="NULLABLE"),
     bigquery.SchemaField("fileSize", "STRING", mode="NULLABLE"),
     bigquery.SchemaField("webuiLink", "STRING", mode="NULLABLE"),
+    bigquery.SchemaField("gcsLink", "STRING", mode="NULLABLE"),
 ]
 
 blogposts_table_schema = [
@@ -250,14 +251,16 @@ def download_confluence_file(file_url: str, save_dir: str) -> str:
     """
     save_path = ""
     try:
-        response = requests.get(file_url, auth=jira_auth_token, stream=True, timeout=15)
+        # file_url format: /download/attachments/818577942/image2021-4-12_13-0-42.png?version=1&modificationDate=1618225243798&cacheVersion=1&api=v2
+        download_url = os.getenv("BASE_URL").removesuffix("api/v2/") + file_url.removeprefix("/")
+        response = requests.get(download_url, auth=auth_token, stream=True, timeout=15)
         response.raise_for_status()
 
-        filename = file_url.split("/")[-1]
+        filename = file_url.split("/")[-1].split("?")[0]
         if not filename:
             content_type = response.headers.get("content-type", "").split(";")[0]
             ext = mimetypes.guess_extension(content_type) or ""
-            filename = f"jira_file{ext}"
+            filename = f"confluence_file{ext}"
 
         save_path = get_next_filename(os.path.join(save_dir, filename))
 
@@ -266,7 +269,7 @@ def download_confluence_file(file_url: str, save_dir: str) -> str:
                 if chunk:
                     f.write(chunk)
     except requests.exceptions.RequestException as e:
-        LOGGER.error("[_download_jira_file] Error: %s", e)
+        LOGGER.error("[_download_confluence_file] Error: %s", e)
     finally:
         return save_path
 
@@ -384,14 +387,12 @@ def write_table_to_bq(table_id: str, schema: list[bigquery.SchemaField], file: s
     return True
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-def make_api_request(resource_type: str) -> list[dict[str, Any]]:
+def make_api_request(resource_type: str, /, **kwargs: Any) -> list[dict[str, Any]] | None:
     """
     Make an API request to Confluence API
     Args:
         resource_type: the type of resource to get
         **kwargs: appropriate parameters to pass to the query
-    Returns:
-        A list containing the extracted data
     """
     yesterday = datetime.today() - timedelta(days=1)
     finished = False
@@ -404,6 +405,10 @@ def make_api_request(resource_type: str) -> list[dict[str, Any]]:
         "cql": f"lastmodified >= {yesterday.strftime("%Y/%m/%d")}"
     }
     raw_url = RESOURCE_TYPES.get(resource_type)
+    if not raw_url:
+        LOGGER.error("unknown recource type passed")
+        return None
+
     url = raw_url.format(url=os.getenv("BASE_URL"))
 
     data: list[dict[str, Any]] = []
@@ -411,7 +416,7 @@ def make_api_request(resource_type: str) -> list[dict[str, Any]]:
         if next_cursor:
             params["cursor"] = next_cursor
 
-        response = requests.get(url, params=params, headers=headers, auth=jira_auth_token, timeout=15).json()
+        response = requests.get(url, params=params, headers=headers, auth=auth_token, timeout=15).json()
         data.extend(response.get("results", []))
         
         if response.get("_links") and response["_links"].get("next"):
@@ -428,6 +433,13 @@ def make_api_request(resource_type: str) -> list[dict[str, Any]]:
     return data
 
 def process_data(raw_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Process the data downloaded, removing unnecessary fields or stringifying nested fields
+    Args:
+        raw_data: unprocessed extracted data
+    Returns:
+        processed data
+    """
     data = []
     for item in raw_data:
         if "_links" in item.keys():
@@ -448,44 +460,82 @@ def process_data(raw_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         data.append(item)
     return data
 
+def process_attachments(raw_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Process attachment data downloaded, removing unnecessary fields or stringifying nested fields.
+    Also downloads and saves attachments to GCS and includes link to the GCS file in the processed data
+    Args:
+        raw_data: unprocessed extracted data
+    Returns:
+        processed data
+    """
+    data = []
+    save_dir = tmp_outpath + "/attachments"
+    os.makedirs(save_dir, exist_ok=True)
+
+    for item in raw_data:
+        if "_links" in item.keys():
+            del item["_links"]
+
+        if "icon" in item.keys():
+            del item["icon"]
+
+        if "version" in item.keys():
+            item["version"] = str(item["version"])
+
+        if "properties" in item.keys():
+            item["properties"] = str(item["properties"])
+
+        if "body" in item.keys():
+            item["body"] = str(item["body"])
+        
+        if "downloadLink" in item.keys():
+            file_path = download_and_verify_confluence_file(item["downloadLink"], save_dir)
+            item["gcsLink"] = file_path
+
+        data.append(item)
+    return data
+
 def get_data() -> None:
     spaces = make_api_request("spaces")
-    LOGGER.info("[get_data] Fetched %d spaces", len(spaces))
+    LOGGER.info("Fetched %d spaces", len(spaces))
     if spaces:
         spaces = process_data(spaces)
         spaces_path = write_jsonl_file(spaces, "spaces")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.spaces", spaces_table_schema, spaces_path)
 
     attachments = make_api_request("attachments")
-    LOGGER.info("[get_data] Fetched %d attachments", len(attachments))
+    LOGGER.info("Fetched %d attachments", len(attachments))
     if attachments:
-        attachments = process_data(attachments)
+        attachments = process_attachments(attachments)
         attachments_path = write_jsonl_file(attachments, "attachments")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.attachments", attachments_table_schema, attachments_path)
 
     blogposts = make_api_request("blogposts")
-    LOGGER.info("[get_data] Fetched %d blogposts", len(blogposts))
+    LOGGER.info("Fetched %d blogposts", len(blogposts))
     if blogposts:
         blogposts = process_data(blogposts)
         blogposts_path = write_jsonl_file(blogposts, "blogposts")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.blogposts", blogposts_table_schema, blogposts_path)
 
     tasks = make_api_request("tasks")
-    LOGGER.info("[get_data] Fetched %d tasks", len(tasks))
+    LOGGER.info("Fetched %d tasks", len(tasks))
     if tasks:
         tasks = process_data(tasks)
         tasks_path = write_jsonl_file(tasks, "tasks")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.tasks", tasks_table_schema, tasks_path)
 
     pages = make_api_request("pages")
-    LOGGER.info("[get_data] Fetched %d pages", len(pages))
+    LOGGER.info("Fetched %d pages", len(pages))
     if pages:
         pages = process_data(pages)
         pages_path = write_jsonl_file(pages, "pages")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.pages", pages_table_schema, pages_path)
 
-    all_comments = make_api_request("footer-comments") + make_api_request("inline-comments")
-    LOGGER.info("[get_data] Fetched %d comments", len(all_comments))
+    footer_comments = make_api_request("footer-comments")
+    inline_comments = make_api_request("inline-comments")
+    all_comments = footer_comments + inline_comments
+    LOGGER.info("Fetched %d comments", len(all_comments))
     if all_comments:
         all_comments = process_data(all_comments)
         all_commnents_path = write_jsonl_file(all_comments, "comments")
