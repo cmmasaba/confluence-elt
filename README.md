@@ -61,5 +61,5 @@ docker compose up
 Refer tp the [LICENSE](LICENSE) for terms of use.
 
 ## Contributions
-Contributions are very much welcome.<br>
+Contributions are very much welcome, open a PR with your additions and request a review.<br>
 If you encounter problems feel free to open an issue.
