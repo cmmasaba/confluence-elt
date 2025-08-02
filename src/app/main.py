@@ -384,12 +384,14 @@ def write_table_to_bq(table_id: str, schema: list[bigquery.SchemaField], file: s
     return True
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-def make_api_request(resource_type: str) -> list[dict[str, Any]] | None:
+def make_api_request(resource_type: str) -> list[dict[str, Any]]:
     """
     Make an API request to Confluence API
     Args:
         resource_type: the type of resource to get
         **kwargs: appropriate parameters to pass to the query
+    Returns:
+        A list containing the extracted data
     """
     yesterday = datetime.today() - timedelta(days=1)
     finished = False
@@ -402,10 +404,6 @@ def make_api_request(resource_type: str) -> list[dict[str, Any]] | None:
         "cql": f"lastmodified >= {yesterday.strftime("%Y/%m/%d")}"
     }
     raw_url = RESOURCE_TYPES.get(resource_type)
-    if not raw_url:
-        LOGGER.error("unknown recource type passed")
-        return None
-
     url = raw_url.format(url=os.getenv("BASE_URL"))
 
     data: list[dict[str, Any]] = []
@@ -452,52 +450,55 @@ def process_data(raw_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def get_data() -> None:
     spaces = make_api_request("spaces")
-    LOGGER.info("Fetched %d spaces", len(spaces))
+    LOGGER.info("[get_data] Fetched %d spaces", len(spaces))
     if spaces:
         spaces = process_data(spaces)
         spaces_path = write_jsonl_file(spaces, "spaces")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.spaces", spaces_table_schema, spaces_path)
 
     attachments = make_api_request("attachments")
-    LOGGER.info("Fetched %d attachments", len(attachments))
+    LOGGER.info("[get_data] Fetched %d attachments", len(attachments))
     if attachments:
         attachments = process_data(attachments)
         attachments_path = write_jsonl_file(attachments, "attachments")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.attachments", attachments_table_schema, attachments_path)
 
     blogposts = make_api_request("blogposts")
-    LOGGER.info("Fetched %d blogposts", len(blogposts))
+    LOGGER.info("[get_data] Fetched %d blogposts", len(blogposts))
     if blogposts:
         blogposts = process_data(blogposts)
         blogposts_path = write_jsonl_file(blogposts, "blogposts")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.blogposts", blogposts_table_schema, blogposts_path)
 
     tasks = make_api_request("tasks")
-    LOGGER.info("Fetched %d tasks", len(tasks))
+    LOGGER.info("[get_data] Fetched %d tasks", len(tasks))
     if tasks:
         tasks = process_data(tasks)
         tasks_path = write_jsonl_file(tasks, "tasks")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.tasks", tasks_table_schema, tasks_path)
 
     pages = make_api_request("pages")
-    LOGGER.info("Fetched %d pages", len(pages))
+    LOGGER.info("[get_data] Fetched %d pages", len(pages))
     if pages:
         pages = process_data(pages)
         pages_path = write_jsonl_file(pages, "pages")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.pages", pages_table_schema, pages_path)
 
-    footer_comments = make_api_request("footer-comments")
-    inline_comments = make_api_request("inline-comments")
-    all_comments = footer_comments + inline_comments
-    LOGGER.info("Fetched %d comments", len(all_comments))
+    all_comments = make_api_request("footer-comments") + make_api_request("inline-comments")
+    LOGGER.info("[get_data] Fetched %d comments", len(all_comments))
     if all_comments:
         all_comments = process_data(all_comments)
         all_commnents_path = write_jsonl_file(all_comments, "comments")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.comments", comments_table_schema, all_commnents_path)
 
-def clean_up(directory: str):
+def clean_up(directory: str) -> None:
     """Delete data downloaded during execution"""
-    shutil.rmtree(directory)
+    if os.path.exists(directory):
+        try:
+            shutil.rmtree(directory)
+            LOGGER.info("[clean_up] Successfully deleted the temporary output folder")
+        except OSError as e:
+            LOGGER.error("[clean_up] Error deleting directory: %s", e)
 
 if __name__ == "__main__":
     get_data()
