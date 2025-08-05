@@ -1,3 +1,4 @@
+import concurrent.futures
 from datetime import datetime, timedelta
 import json
 import logging
@@ -15,7 +16,7 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 jira_api_url          = os.getenv("BASE_URL")
 project_name          = os.getenv("PROJECT_NAME")
-auth_token       = HTTPBasicAuth(os.getenv("EMAIL"), os.getenv("API_TOKEN"))
+auth_token            = HTTPBasicAuth(os.getenv("EMAIL"), os.getenv("API_TOKEN"))
 dataset_name          = os.getenv("DATASET")
 gcs_bucket_name       = os.getenv("GCP_STORAGE_BUCKET")
 bq_client             = bigquery.Client(project=project_name)
@@ -146,6 +147,7 @@ def configure_cloud_logging() -> logging.Logger:
     logger.addHandler(file_handler)
 
     return logger
+
 LOGGER = configure_cloud_logging()
 
 def directory_exists(directory_name: str) -> bool:
@@ -330,7 +332,7 @@ def get_next_filename(file_path: str) -> str:
 def write_jsonl_file(data_list: list[dict[str, Any]], filename_prefix: str) -> str | None:
     file_path = None
     if data_list:
-        file_path = f"{tmp_outpath}/{filename_prefix}_{datetime.now().strftime("%Y%m%d")}.jsonl"
+        file_path = f"{tmp_outpath}/{filename_prefix}_{datetime.today().strftime("%Y%m%d")}.jsonl"
         with open(file_path, "w", encoding="utf-8") as fp:
             for item in data_list:
                 json.dump(item, fp=fp)
@@ -387,7 +389,7 @@ def write_table_to_bq(table_id: str, schema: list[bigquery.SchemaField], file: s
     return True
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-def make_api_request(resource_type: str, /, **kwargs: Any) -> list[dict[str, Any]] | None:
+def make_api_request(resource_type: str) -> list[dict[str, Any]] | None:
     """
     Make an API request to Confluence API
     Args:
@@ -432,9 +434,58 @@ def make_api_request(resource_type: str, /, **kwargs: Any) -> list[dict[str, Any
 
     return data
 
+def clean_data(raw_data: list[dict[str, Any]], category: str = "data") -> list[dict[str, Any]]:
+    """
+    Start threads to clean the raw data submitted.
+    Args:
+        raw_data: the raw data to be processed
+        category: the categore of the passed in data. Can be 'data' or 'attachments'
+    Return:
+        returns a list of dicts containing the cleaned version of the passed in data
+    """
+    cleaned_data: list[dict[str, Any]] = []
+    ranges = []
+    max_workers = 0
+    part_size = 0
+
+    if len(raw_data) > 500:
+        if len(raw_data) < 2000:
+            max_workers = 2
+        elif len(raw_data) < 5000:
+            max_workers = 4
+        elif len(raw_data) < 8000:
+            max_workers = 6
+        else:
+            max_workers = 10
+        part_size = len(raw_data) / max_workers
+    else:
+        max_workers = 1
+        part_size = len(raw_data)
+
+    for i in range(max_workers):
+        start = int(i * part_size)
+        end = int((i + 1) * part_size)
+        ranges.append((start, end))
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as thread_exececutor:
+        if category == "attachments":
+            futures = [thread_exececutor.submit(process_attachments, raw_data[start:end]) for start, end in ranges]
+        else:
+            futures = [thread_exececutor.submit(process_data, raw_data[start:end]) for start, end in ranges]
+        
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                cleaned_data.extend(future.result(timeout=300))
+                LOGGER.info("[clean_data] Records cleaned so far: %d", len(cleaned_data))
+            except Exception as e:
+                LOGGER.error("[clean_data] Error cleaning data: %s", e)
+                continue
+
+    return cleaned_data
+
 def process_data(raw_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Process the data downloaded, removing unnecessary fields or stringifying nested fields
+    Cleans the input data by emoving unnecessary fields or stringifying nested fields
     Args:
         raw_data: unprocessed extracted data
     Returns:
@@ -462,8 +513,8 @@ def process_data(raw_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def process_attachments(raw_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Process attachment data downloaded, removing unnecessary fields or stringifying nested fields.
-    Also downloads and saves attachments to GCS and includes link to the GCS file in the processed data
+    Cleans input data by removing unnecessary fields or stringifying nested fields.
+    Also downloads and saves attachments to GCS, and includes link to the GCS file in the processed data
     Args:
         raw_data: unprocessed extracted data
     Returns:
@@ -491,7 +542,9 @@ def process_attachments(raw_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         
         if "downloadLink" in item.keys():
             file_path = download_and_verify_confluence_file(item["downloadLink"], save_dir)
-            item["gcsLink"] = file_path
+            if file_path:
+                gcs_link = gcs_add_file(file_path)
+                item["gcsLink"] = gcs_link
 
         data.append(item)
     return data
@@ -500,46 +553,45 @@ def get_data() -> None:
     spaces = make_api_request("spaces")
     LOGGER.info("Fetched %d spaces", len(spaces))
     if spaces:
-        spaces = process_data(spaces)
+        spaces = clean_data(spaces)
         spaces_path = write_jsonl_file(spaces, "spaces")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.spaces", spaces_table_schema, spaces_path)
-
-    attachments = make_api_request("attachments")
-    LOGGER.info("Fetched %d attachments", len(attachments))
-    if attachments:
-        attachments = process_attachments(attachments)
-        attachments_path = write_jsonl_file(attachments, "attachments")
-        write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.attachments", attachments_table_schema, attachments_path)
 
     blogposts = make_api_request("blogposts")
     LOGGER.info("Fetched %d blogposts", len(blogposts))
     if blogposts:
-        blogposts = process_data(blogposts)
+        blogposts = clean_data(blogposts)
         blogposts_path = write_jsonl_file(blogposts, "blogposts")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.blogposts", blogposts_table_schema, blogposts_path)
 
     tasks = make_api_request("tasks")
     LOGGER.info("Fetched %d tasks", len(tasks))
     if tasks:
-        tasks = process_data(tasks)
+        tasks = clean_data(tasks)
         tasks_path = write_jsonl_file(tasks, "tasks")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.tasks", tasks_table_schema, tasks_path)
 
     pages = make_api_request("pages")
     LOGGER.info("Fetched %d pages", len(pages))
     if pages:
-        pages = process_data(pages)
+        pages = clean_data(pages)
         pages_path = write_jsonl_file(pages, "pages")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.pages", pages_table_schema, pages_path)
 
-    footer_comments = make_api_request("footer-comments")
-    inline_comments = make_api_request("inline-comments")
-    all_comments = footer_comments + inline_comments
+    all_comments = make_api_request("footer-comments") + make_api_request("inline-comments")
     LOGGER.info("Fetched %d comments", len(all_comments))
     if all_comments:
-        all_comments = process_data(all_comments)
+        all_comments = clean_data(all_comments)
         all_commnents_path = write_jsonl_file(all_comments, "comments")
         write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.comments", comments_table_schema, all_commnents_path)
+
+    attachments = make_api_request("attachments")
+    LOGGER.info("Fetched %d attachments", len(attachments))
+    if attachments:
+        attachments = clean_data(attachments, category="attachments")
+        attachments_path = write_jsonl_file(attachments, "attachments")
+        write_table_to_bq(f"{os.getenv("PROJECT_NAME")}.{os.getenv("DATASET")}.attachments", attachments_table_schema, attachments_path)
+
 
 def clean_up(directory: str) -> None:
     """Delete data downloaded during execution"""
